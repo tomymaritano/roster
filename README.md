@@ -1,56 +1,56 @@
 # roster
 
-Lista los agentes de código que están vivos en esta máquina: Claude, Grok y Codex.
+Lists the coding agents that are alive on this machine: Claude, Grok, and Codex.
 
-No es una terminal. cmux sigue siendo la ventana, Neovim el editor y tmux el motor de las sesiones. roster responde tres cosas: quién está corriendo, en qué carpeta, y cómo entrar sin matarlo al cerrar la lista.
+This is not a terminal. cmux stays the window, Neovim stays the editor, and tmux stays the session engine. roster answers three things: who is running, which directory they are in, and how to attach without killing them when the list closes.
 
-## Qué muestra
+## What it shows
 
-Una fila entra si el ejecutable del proceso es exactamente `claude`, `grok` o `codex`. No entran la app de ChatGPT, los helpers de Claude.app ni el historial de sesiones viejas.
+A row is included when the process executable is exactly `claude`, `grok`, or `codex`. The ChatGPT app, Claude.app helpers, and old session history are not included.
 
-| Agente | Estado |
+| Agent | Status |
 | --- | --- |
-| Claude | El de `claude agents --json`. `busy` se muestra como `working`. `waiting` e `idle` se muestran como vienen. Cualquier otra palabra se muestra cruda. |
-| Grok | `running`. No publica waiting ni idle. |
-| Codex | `running`, y solo si hay un proceso `codex`. El historial en `~/.codex/sessions` no es una sesión viva. |
+| Claude | From `claude agents --json`. `busy` is shown as `working`. `waiting` and `idle` are shown as reported. Any other word is shown raw. |
+| Grok | `running`. It does not publish waiting or idle. |
+| Codex | `running`, and only when a `codex` process exists. History under `~/.codex/sessions` is not a live session. |
 
-Si el proceso no está en un pane de tmux, la segunda línea dice `sin tmux`. Enter no inventa un salto. Para meterlo en tmux: `roster open`.
+If the process is not in a tmux pane, the second line says `not in tmux`. Enter does not invent a jump. To put it in tmux: `roster open`.
 
-Cerrar la lista, o el popup, no mata al agente. `ctrl-x` mata el proceso, y solo si sigue siendo `claude`, `grok` o `codex`.
+Closing the list, or the popup, does not kill the agent. `ctrl-x` kills the process, and only if it is still `claude`, `grok`, or `codex`.
 
-## Uso
+## Usage
 
 ```bash
-roster                         # popup si estás en tmux; si no, el picker
-roster list                    # imprime la lista
-roster list --plain            # sin color
-roster open claude             # una sesión por carpeta, en el directorio actual
+roster                         # popup inside tmux; otherwise the picker
+roster list                    # print the list
+roster list --plain            # no color
+roster open claude             # one session per directory, in the current directory
 roster open grok --dir ~/src/foo
-roster open claude --detach    # crea o reusa la sesión e imprime el nombre
+roster open claude --detach    # create or reuse the session and print its name
 ```
 
-Dentro de tmux, `Ctrl-b g` abre la lista. Enter entra. Esc cierra. Si apretás `Ctrl-b g` desde el popup de un agente, el popup se cierra y la sesión sigue.
+Inside tmux, `Ctrl-b g` opens the list. Enter attaches. Esc closes. Pressing `Ctrl-b g` from an agent's popup closes that popup and leaves the session running.
 
-`roster open` reusa la sesión de esa carpeta. No lanza un segundo proceso si ya existe.
+`roster open` reuses the session for that directory. It does not launch a second process when one already exists.
 
-El binario se puede forzar con `ROSTER_CMD_claude`, `ROSTER_CMD_grok` o `ROSTER_CMD_codex`. Grok, si no hay override, usa `~/.grok/bin/grok` antes que el wrapper que cmux deja en el `PATH`.
+The binary can be overridden with `ROSTER_CMD_claude`, `ROSTER_CMD_grok`, or `ROSTER_CMD_codex`. Grok, when there is no override, uses `~/.grok/bin/grok` before the wrapper cmux puts on `PATH`.
 
-## Instalar
+## Install
 
-Hacen falta bash, tmux 3.2 o más nuevo, fzf, jq y lsof.
+Requires bash, tmux 3.2 or newer, fzf, jq, and lsof.
 
 ```bash
 ln -sfn "$HOME/Documents/Github/roster/bin/roster" "$HOME/.local/bin/roster"
 ```
 
-En `~/.tmux.conf`, o en el archivo al que ese path apunte:
+In `~/.tmux.conf`, or in the file that path points to:
 
 ```tmux
 bind-key g run-shell "$HOME/.local/bin/roster popup #{q:client_name}"
 ```
 
-Después: `tmux source-file ~/.tmux.conf`.
+Then: `tmux source-file ~/.tmux.conf`.
 
-## Licencia
+## License
 
 MIT.
