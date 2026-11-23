@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# roster — lista de agentes de código vivos.
+#
+# Claude, Grok y Codex. El estado sale del propio CLI cuando existe
+# (Claude: waiting / idle / busy). Si el proceso está vivo y nadie dijo
+# más, la fila dice "running". Cerrar la lista no mata a nadie.
+set -euo pipefail
+
+version=0.1.0
+
+# TSV que ve fzf, después de finalize_rows:
+# rank pid pane loc agent status age path session tty
+# merge_rows agrega age_secs al final solo para ordenar.
+
+tmux_cmd() {
+  if [ -n "${ROSTER_TMUX_L:-}" ]; then
+    command tmux -L "$ROSTER_TMUX_L" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
+# No arrancar un server vacío solo por mirar. En macOS el socket vive en
+# /private/tmp, y /tmp es el mismo directorio.
+tmux_socket_exists() {
+  local name=${ROSTER_TMUX_L:-default}
+  local uid dir
+  uid=$(id -u)
+  local dirs=("/tmp/tmux-$uid" "/private/tmp/tmux-$uid")
+  if [ -n "${TMUX_TMPDIR:-}" ]; then
+    dirs+=("$TMUX_TMPDIR/tmux-$uid")
+  fi
+  for dir in "${dirs[@]}"; do
+    if [ -S "$dir/$name" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# busy es la palabra de Claude para "está trabajando". El resto se muestra
+# como vino. running lo ponemos nosotros cuando solo sabemos que el proceso vive.
+label_status() {
+  case "$1" in
+    busy) printf 'working' ;;
+    waiting | idle | working | running) printf '%s' "$1" ;;
+    '') printf 'running' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+status_rank() {
+  case "$1" in
+    waiting) printf '0' ;;
+    idle) printf '1' ;;
+    running) printf '2' ;;
+    working) printf '3' ;;
+    *) printf '4' ;;
+  esac
+}
+
+status_color() {
+  case "$1" in
+    waiting) printf '\033[33m%s\033[0m' "$1" ;;
+    idle) printf '\033[32m%s\033[0m' "$1" ;;
+    working) printf '\033[31m%s\033[0m' "$1" ;;
+    *) printf '\033[90m%s\033[0m' "$1" ;;
+  esac
+}
+
+# [[dd-]hh:]mm:ss  → segundos. ps etime no lleva espacios.
+etime_to_secs() {
+  local t=${1:-} days=0 rest a b c
+  if [ -z "$t" ]; then
+    printf '0'
+    return 0
+  fi
+  rest=$t
+  if [[ $rest == *-* ]]; then
+    days=${rest%%-*}
+    rest=${rest#*-}
+  fi
+  IFS=: read -r a b c <<<"$rest"
+  a=${a:-0}
+  b=${b:-0}
+  if [[ ! $days =~ ^[0-9]+$ || ! $a =~ ^[0-9]+$ || ! $b =~ ^[0-9]+$ ]]; then
+    printf '0'
+    return 0
+  fi
+  if [[ $rest == *:*:* ]]; then
+    c=${c:-0}
+    if [[ ! $c =~ ^[0-9]+$ ]]; then
+      printf '0'
+      return 0
+    fi
+    printf '%s' $((10#$days * 86400 + 10#$a * 3600 + 10#$b * 60 + 10#$c))
+  else
+    printf '%s' $((10#$days * 86400 + 10#$a * 60 + 10#$b))
+  fi
+}
+
+age_human() {
+  local secs=${1:-0}
+  if [ "$secs" -lt 0 ]; then
+    secs=0
+  fi
+  if [ "$secs" -lt 60 ]; then
+    printf 'hace %ss' "$secs"
+  elif [ "$secs" -lt 3600 ]; then
+    printf 'hace %sm' $((secs / 60))
+  elif [ "$secs" -lt 172800 ]; then
+    printf 'hace %sh' $((secs / 3600))
+  else
+    printf 'hace %sd' $((secs / 86400))
+  fi
+}
+
+short_path() {
+  local path=$1 home=$HOME
+  if [ -z "$path" ] || [ "$path" = "-" ]; then
+    printf '-'
+    return 0
+  fi
+  case $path in
+    "$home") printf '~' ;;
+    "$home"/*) printf '~%s' "${path#"$home"}" ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
+cwd_of() {
+  local pid=$1 line
+  line=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ { print substr($0, 2); exit }') || true
+  printf '%s' "${line:--}"
+}
+
+# Procesos cuyo ejecutable es exactamente claude, grok o codex.
+# No entra el renderer de la app de Codex ni los helpers de Claude.app.
+collect_procs() {
+  local pid comm tty etime secs cwd
+  ps -ax -o pid=,comm=,tty=,etime= | while read -r pid comm tty etime; do
+    case $comm in
+      claude | grok | codex) ;;
+      *) continue ;;
+    esac
+    if [ "$tty" = "??" ] || [ -z "$tty" ]; then
+      tty="-"
+    fi
+    secs=$(etime_to_secs "$etime")
+    cwd=$(cwd_of "$pid")
+    printf 'P\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$comm" "$tty" "$secs" "$cwd"
+  done
+}
+
+# Estado oficial de Claude. Un pid que ya no está en ps no genera fila.
+# ROSTER_CMD_claude no se usa acá: ese override es el proceso a lanzar,
+# y un stub de prueba no sabe responder `agents --json`.
+collect_claude() {
+  local bin out
+  bin=$(command -v claude || true)
+  [ -n "$bin" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  out=$("$bin" agents --json 2>/dev/null) || return 0
+  printf '%s\n' "$out" | jq -r '
+    .[] | select(.kind == "interactive")
+    | [.pid, (.status // ""), (.cwd // ""), ((.startedAt // 0) / 1000 | floor)]
+    | @tsv
+  ' | while IFS=$'\t' read -r pid status cwd started; do
+    [ -n "${pid:-}" ] || continue
+    printf 'C\t%s\t%s\t%s\t%s\n' "$pid" "$status" "$cwd" "$started"
+  done
+}
+
+collect_panes() {
+  tmux_socket_exists || return 0
+  tmux_cmd list-panes -a -F $'#{pane_tty}\t#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}' 2>/dev/null |
+    while IFS=$'\t' read -r tty pane loc session; do
+      tty=${tty#/dev/}
+      printf 'T\t%s\t%s\t%s\t%s\n' "$tty" "$pane" "$loc" "$session"
+    done
+}
+
+# TSV: rank pid pane loc agent status age path session tty age_secs
+merge_rows() {
+  awk -F'\t' -v now="$(date +%s)" -v home="$HOME" '
+    function human(secs) {
+      if (secs < 0) secs = 0
+      if (secs < 60) return sprintf("hace %ss", secs)
+      if (secs < 3600) return sprintf("hace %sm", int(secs / 60))
+      if (secs < 172800) return sprintf("hace %sh", int(secs / 3600))
+      return sprintf("hace %sd", int(secs / 86400))
+    }
+    function rank_of(st) {
+      if (st == "waiting") return 0
+      if (st == "idle") return 1
+      if (st == "running") return 2
+      if (st == "working") return 3
+      return 4
+    }
+    function label(st) {
+      if (st == "busy") return "working"
+      if (st == "") return "running"
+      return st
+    }
+    function short(path) {
+      if (path == "" || path == "-") return "-"
+      if (path == home) return "~"
+      if (index(path, home "/") == 1) return "~" substr(path, length(home) + 1)
+      return path
+    }
+    $1 == "P" { live[$2] = 1; agent[$2] = $3; tty[$2] = $4; age[$2] = $5; cwd[$2] = $6; next }
+    $1 == "C" {
+      if (!live[$2]) next
+      status[$2] = label($3)
+      if ($4 != "") cwd[$2] = $4
+      if ($5 + 0 > 0) age[$2] = now - $5
+      next
+    }
+    $1 == "T" { pane[$2] = $3; loc[$2] = $4; sess[$2] = $5; next }
+    END {
+      for (pid in live) {
+        st = status[pid]
+        if (st == "") st = "running"
+        t = tty[pid]
+        p = (t in pane) ? pane[t] : "-"
+        l = (t in loc) ? loc[t] : "-"
+        s = (t in sess) ? sess[t] : "-"
+        a = age[pid] + 0
+        if (a < 0) a = 0
+        printf "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+          rank_of(st), pid, p, l, agent[pid], st, human(a), short(cwd[pid]), s, t, a
+      }
+    }
+  '
+}
+
+finalize_rows() {
+  sort -t $'\t' -k1,1n -k11,11n -k2,2n | cut -f1-10
+}
+
+rows() {
+  {
+    collect_procs || true
+    collect_claude || true
+    collect_panes || true
+  } | merge_rows | finalize_rows
+}
+
+print_human() {
+  local plain=${1:-} _rank _pid pane loc agent status age path _session _tty colored pad
+  local any=0
+  while IFS=$'\t' read -r _rank _pid pane loc agent status age path _session _tty; do
+    [ -n "${agent:-}" ] || continue
+    any=1
+    if [ "$pane" = "-" ]; then
+      loc="sin tmux"
+    fi
+    pad=$(printf '%-10s' "$status")
+    if [ "$plain" = plain ]; then
+      colored=$pad
+    else
+      colored=$(status_color "$pad")
+    fi
+    printf '%-8s %s %-10s %s\n' "$agent" "$colored" "$age" "$path"
+    printf '         %s\n' "$loc"
+  done
+  if [ "$any" -eq 0 ]; then
+    printf 'ningún agente vivo\n'
+    return 1
+  fi
+}
+
+cmd_list() {
+  local plain=
+  if [ "${1:-}" = "--plain" ] || [ ! -t 1 ]; then
+    plain=plain
+  fi
+  rows | print_human "$plain"
+}
+
+preview_of() {
+  local pane=${1:-} tty=${2:-}
+  if [ -n "$pane" ] && [ "$pane" != "-" ]; then
+    tmux_cmd capture-pane -p -t "$pane" 2>/dev/null | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}'
+    return 0
+  fi
+  printf 'Fuera de tmux (%s).\nAbrilo con: roster open <claude|grok|codex>\n' "$tty"
+}
+
+cmd_jump() {
+  local pane=${1:-} session=${2:-} tty=${3:-} agent=${4:-}
+  if [ "$pane" = "-" ] || [ -z "$pane" ]; then
+    printf '%s está en %s, fuera de tmux.\n' "${agent:-el agente}" "$tty" >&2
+    return 1
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    tmux_cmd switch-client -t "$pane"
+  else
+    tmux_cmd attach-session -t "$session"
+  fi
+}
+
+cmd_kill() {
+  local pid=${1:-} comm
+  case $pid in
+    '' | *[!0-9]*)
+      printf 'no mato el pid %s\n' "${pid:-vacío}" >&2
+      return 1
+      ;;
+  esac
+  comm=$(ps -p "$pid" -o comm= 2>/dev/null | awk '{$1=$1; print}') || true
+  case $comm in
+    claude | grok | codex) kill "$pid" ;;
+    *)
+      printf 'no mato el pid %s (%s)\n' "$pid" "${comm:-no existe}" >&2
+      return 1
+      ;;
+  esac
+}
+
+cmd_pick() {
+  local self=$0 qself data selected
+  command -v fzf >/dev/null 2>&1 || {
+    printf 'roster: falta fzf\n' >&2
+    return 1
+  }
+  qself=$(printf '%q' "$self")
+  data=$(rows || true)
+  if [ -z "$data" ]; then
+    printf 'ningún agente vivo\n' >&2
+    return 1
+  fi
+  # Campos: 2 pid, 3 pane, 5 agente, 6 estado, 7 edad, 8 path, 10 tty.
+  selected=$(
+    printf '%s\n' "$data" | fzf \
+      --ansi \
+      --with-nth 5,6,7,8 \
+      --delimiter $'\t' \
+      --no-multi \
+      --prompt 'roster> ' \
+      --header 'enter entra · ctrl-x mata el proceso · esc cierra' \
+      --preview "$qself preview {3} {10}" \
+      --preview-window=down:40%:wrap \
+      --bind "ctrl-x:execute-silent($qself kill {2})+reload($qself rows)"
+  ) || return 0
+  [ -n "$selected" ] || return 0
+  IFS=$'\t' read -r _rank pid pane _loc agent _status _age _path session tty <<<"$selected"
+  cmd_jump "$pane" "$session" "$tty" "$agent"
+}
+
+agent_bin() {
+  local agent=$1 override bin
+  override="ROSTER_CMD_${agent}"
+  if [ -n "${!override:-}" ]; then
+    printf '%s' "${!override}"
+    return 0
+  fi
+  case $agent in
+    claude) bin=$(command -v claude || true) ;;
+    grok)
+      if [ -x "$HOME/.grok/bin/grok" ]; then
+        bin=$HOME/.grok/bin/grok
+      else
+        bin=$(command -v grok || true)
+      fi
+      ;;
+    codex) bin=$(command -v codex || true) ;;
+    *)
+      printf 'agente desconocido: %s\n' "$agent" >&2
+      return 1
+      ;;
+  esac
+  if [ -z "$bin" ]; then
+    printf 'no encuentro el binario de %s\n' "$agent" >&2
+    return 1
+  fi
+  printf '%s' "$bin"
+}
+
+session_name_for() {
+  local agent=$1 dir=$2 hash
+  hash=$(printf '%s' "$dir" | shasum -a 256 | cut -c1-8)
+  printf 'roster-%s-%s' "$agent" "$hash"
+}
+
+cmd_open() {
+  local agent=${1:-}
+  local dir=$PWD
+  local detach=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dir)
+        dir=${2:-}
+        shift 2
+        ;;
+      --detach) detach=1; shift ;;
+      *)
+        printf 'uso: roster open <claude|grok|codex> [--dir DIR] [--detach]\n' >&2
+        return 1
+        ;;
+    esac
+  done
+  case $agent in
+    claude | grok | codex) ;;
+    *)
+      printf 'uso: roster open <claude|grok|codex>\n' >&2
+      return 1
+      ;;
+  esac
+  dir=$(cd "$dir" && pwd -P)
+  local bin session attach_cmd
+  bin=$(agent_bin "$agent")
+  session=$(session_name_for "$agent" "$dir")
+  if ! tmux_cmd has-session -t "$session" 2>/dev/null; then
+    tmux_cmd new-session -d -s "$session" -c "$dir" -- "$bin"
+    tmux_cmd set-option -t "$session" detach-on-destroy on || true
+  fi
+  printf '%s\n' "$session"
+  [ "$detach" -eq 1 ] && return 0
+  if [ -n "${ROSTER_TMUX_L:-}" ]; then
+    attach_cmd="tmux -L $(printf '%q' "$ROSTER_TMUX_L") attach-session -t $(printf '%q' "$session")"
+  else
+    attach_cmd="tmux attach-session -t $(printf '%q' "$session")"
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    tmux_cmd display-popup -w 90% -h 90% -b rounded -T " $agent " -E "$attach_cmd"
+  else
+    tmux_cmd attach-session -t "$session"
+  fi
+}
+
+cmd_popup() {
+  local me=${1:-} my_session=""
+  if ! tmux_socket_exists; then
+    printf 'roster: no hay un tmux abierto\n' >&2
+    return 1
+  fi
+  if [ -n "$me" ]; then
+    my_session=$(tmux_cmd list-clients -F '#{client_name} #{session_name}' 2>/dev/null |
+      awk -v me="$me" '$1 == me { print $2; exit }') || true
+  elif [ -n "${TMUX:-}" ]; then
+    my_session=$(tmux_cmd display-message -p '#{session_name}' 2>/dev/null || true)
+  fi
+  case $my_session in
+    roster-*)
+      if [ -n "$me" ]; then
+        tmux_cmd detach-client -t "$me"
+      else
+        tmux_cmd detach-client
+      fi
+      return 0
+      ;;
+  esac
+  tmux_cmd display-popup -w 90% -h 90% -b rounded -T ' roster ' -E "$(printf '%q' "$0") pick"
+}
+
+cmd_rows() {
+  rows
+}
+
+usage() {
+  cat <<EOF
+roster $version — agentes vivos (claude, grok, codex)
+
+  roster                         lista interactiva (popup si estás en tmux)
+  roster list [--plain]          imprime la lista
+  roster open <agente> [--dir D] abre o reengancha ese agente en esta carpeta
+  roster popup [client]          popup de tmux (prefix + g)
+
+Enter entra a la sesión de tmux. Esc cierra la lista y no mata a nadie.
+ctrl-x mata el proceso, y solo si es claude, grok o codex.
+Si el agente no está en tmux, la fila dice "sin tmux" y Enter no inventa un salto.
+EOF
+}
+
+main() {
+  local cmd=${1:-}
+  case $cmd in
+    -h | --help | help) usage ;;
+    -v | --version) printf '%s\n' "$version" ;;
+    list) shift; cmd_list "$@" ;;
+    pick) cmd_pick ;;
+    open) shift; cmd_open "$@" ;;
+    popup) shift; cmd_popup "$@" ;;
+    jump) shift; cmd_jump "$@" ;;
+    kill) shift; cmd_kill "$@" ;;
+    preview) shift; preview_of "$@" ;;
+    rows) cmd_rows ;;
+    '')
+      if [ -n "${TMUX:-}" ]; then
+        cmd_popup ""
+      elif [ -t 1 ]; then
+        cmd_pick
+      else
+        cmd_list --plain
+      fi
+      ;;
+    *)
+      usage >&2
+      return 1
+      ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
